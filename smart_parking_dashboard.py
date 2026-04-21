@@ -15,7 +15,7 @@ SerialError = serial.SerialException if serial else OSError
 class SmartParkingDashboard:
     BAUD_RATE = 9600
     REFRESH_MS = 200
-    TOTAL_SLOTS = 4
+    TOTAL_SLOTS = 2
 
     BG = "#101114"
     SURFACE = "#191b20"
@@ -38,6 +38,8 @@ class SmartParkingDashboard:
 
         self.serial_connection = None
         self.current_slots = None
+        self.car_count = None
+        self.slot_states = [None] * self.TOTAL_SLOTS
         self.logs = []
         self.history_window = None
         self.history_listbox = None
@@ -270,7 +272,7 @@ class SmartParkingDashboard:
 
         tk.Label(
             top,
-            text="Live count from Arduino",
+            text="Live count and slot sensors from Arduino",
             bg=self.SURFACE,
             fg=self.MUTED,
             font=("Segoe UI", 10),
@@ -281,16 +283,13 @@ class SmartParkingDashboard:
         self.slot_grid.columnconfigure(0, weight=1)
         self.slot_grid.columnconfigure(1, weight=1)
         self.slot_grid.rowconfigure(0, weight=1)
-        self.slot_grid.rowconfigure(1, weight=1)
 
         for index in range(self.TOTAL_SLOTS):
             card = self._create_slot_card(index + 1)
-            row = index // 2
-            column = index % 2
-            card["frame"].grid(row=row, column=column, sticky="nsew", padx=8, pady=8)
+            card["frame"].grid(row=0, column=index, sticky="nsew", padx=8, pady=8)
             self.slot_cards.append(card)
 
-        self.update_slot_view(None)
+        self.update_slot_view()
 
     def _create_slot_card(self, slot_number):
         frame = tk.Frame(self.slot_grid, bg=self.SURFACE_2, padx=18, pady=18)
@@ -406,56 +405,139 @@ class SmartParkingDashboard:
         self.root.after(self.REFRESH_MS, self.read_serial_data)
 
     def handle_arduino_message(self, message):
-        if message == "ENTRY":
-            self.set_status("Car entered", self.GREEN)
-            self.add_log("ENTRY - Car entered")
+        if message.startswith("COUNT:"):
+            self.handle_state_packet(message)
+        elif message == "ENTRY":
+            self.set_status("Entry detected", self.GREEN)
+            self.add_log("Entry detected")
         elif message == "EXIT":
-            self.set_status("Car exited", self.BLUE)
-            self.add_log("EXIT - Car exited")
+            self.set_status("Exit detected", self.BLUE)
+            self.add_log("Exit detected")
         elif message == "FULL":
             self.set_status("Parking full", self.RED)
-            self.add_log("FULL - Gate stayed closed")
-            self.update_slot_view(0)
+            self.add_log("Parking full")
         elif message.startswith("SLOTS:"):
-            self.update_slots(message)
+            self.update_slots_from_legacy_message(message)
         else:
-            self.add_log(f"Arduino: {message}")
+            self.add_log(f"Malformed serial input ignored: {message}")
 
-    def update_slots(self, message):
-        try:
-            slots = int(message.split(":", 1)[1])
-        except ValueError:
-            self.add_log(f"Bad slot message: {message}")
+    def handle_state_packet(self, message):
+        data = self.parse_state_packet(message)
+
+        if data is None:
+            self.add_log(f"Malformed serial input ignored: {message}")
             return
 
-        slots = max(0, min(self.TOTAL_SLOTS, slots))
-        self.current_slots = slots
-        self.slots_var.set(str(slots))
-        self.occupied_var.set(f"{self.TOTAL_SLOTS - slots} occupied / {self.TOTAL_SLOTS} total")
-        self.update_slot_view(slots)
-        self.add_log(f"SLOTS - {slots} available")
+        previous_count = self.car_count
+        previous_slots = list(self.slot_states)
 
-    def update_slot_view(self, slots):
-        if slots is None:
-            occupied = 0
-            available = 0
-        else:
-            available = max(0, min(self.TOTAL_SLOTS, slots))
-            occupied = self.TOTAL_SLOTS - available
+        count = data["COUNT"]
+        slot_states = [data["SLOT1"], data["SLOT2"]]
 
+        self.car_count = count
+        self.slot_states = slot_states
+
+        available = self.TOTAL_SLOTS - count
+        self.current_slots = available
+        self.slots_var.set(str(available))
+        self.occupied_var.set(f"{count} occupied / {self.TOTAL_SLOTS} total")
+
+        self.update_slot_view()
+        self.update_indicator(available)
+        self.log_state_changes(previous_count, previous_slots, count, slot_states)
+        self.update_status_from_count(previous_count, count)
+
+    def parse_state_packet(self, message):
+        values = {}
+
+        for part in message.split():
+            if ":" not in part:
+                return None
+
+            key, raw_value = part.split(":", 1)
+            if key not in {"COUNT", "SLOT1", "SLOT2"}:
+                return None
+
+            try:
+                values[key] = int(raw_value)
+            except ValueError:
+                return None
+
+        if set(values) != {"COUNT", "SLOT1", "SLOT2"}:
+            return None
+
+        if not 0 <= values["COUNT"] <= self.TOTAL_SLOTS:
+            return None
+
+        if values["SLOT1"] not in (0, 1) or values["SLOT2"] not in (0, 1):
+            return None
+
+        return values
+
+    def log_state_changes(self, previous_count, previous_slots, count, slot_states):
+        if previous_count is None:
+            self.add_log("Live data received")
+        elif count > previous_count:
+            self.add_log("Entry detected")
+        elif count < previous_count:
+            self.add_log("Exit detected")
+
+        for index, state in enumerate(slot_states):
+            old_state = previous_slots[index]
+            if old_state == state:
+                continue
+
+            slot_number = index + 1
+            if state == 1:
+                self.add_log(f"Slot {slot_number} occupied")
+            else:
+                self.add_log(f"Slot {slot_number} free")
+
+    def update_status_from_count(self, previous_count, count):
+        if previous_count is None:
+            color = self.RED if count == self.TOTAL_SLOTS else self.BLUE
+            text = "Parking full" if count == self.TOTAL_SLOTS else "Live data connected"
+            self.set_status(text, color)
+        elif count > previous_count:
+            self.set_status("Entry detected", self.GREEN)
+        elif count < previous_count:
+            self.set_status("Exit detected", self.BLUE)
+        elif count == self.TOTAL_SLOTS:
+            self.set_status("Parking full", self.RED)
+
+    def update_slots_from_legacy_message(self, message):
+        try:
+            available = int(message.split(":", 1)[1])
+        except ValueError:
+            self.add_log(f"Malformed serial input ignored: {message}")
+            return
+
+        available = max(0, min(self.TOTAL_SLOTS, available))
+        count = self.TOTAL_SLOTS - available
+        previous_count = self.car_count
+
+        self.car_count = count
+        self.current_slots = available
+        self.slots_var.set(str(available))
+        self.occupied_var.set(f"{count} occupied / {self.TOTAL_SLOTS} total")
+        self.update_indicator(available)
+
+        if previous_count is None or previous_count != count:
+            self.update_status_from_count(previous_count, count)
+
+    def update_slot_view(self):
         for index, card in enumerate(self.slot_cards):
-            is_occupied = slots is not None and index < occupied
-            is_available = slots is not None and index >= occupied
+            state = self.slot_states[index]
 
-            if is_occupied:
+            if state == 1:
                 bg = "#322024"
                 fg = self.RED
                 text = "Occupied"
                 dot = self.RED
-            elif is_available:
+            elif state == 0:
                 bg = "#173024"
                 fg = self.GREEN
-                text = "Available"
+                text = "Free"
                 dot = self.GREEN
             else:
                 bg = self.SURFACE_2
@@ -469,15 +551,13 @@ class SmartParkingDashboard:
             card["marker"].configure(bg=bg)
             card["marker"].itemconfig(card["dot"], fill=dot)
 
-        self.update_indicator(available if slots is not None else None)
-
-    def update_indicator(self, slots):
-        if slots is None:
+    def update_indicator(self, available):
+        if available is None:
             color = self.MUTED
             ratio = 0
         else:
-            color = self.GREEN if slots > 0 else self.RED
-            ratio = slots / self.TOTAL_SLOTS
+            color = self.GREEN if available > 0 else self.RED
+            ratio = available / self.TOTAL_SLOTS
 
         self.slots_label.configure(fg=color)
         width = max(1, self.indicator.winfo_width())
